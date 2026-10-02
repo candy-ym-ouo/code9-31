@@ -378,12 +378,14 @@ CREATE TABLE IF NOT EXISTS notification_channel (
 CREATE TABLE IF NOT EXISTS offline_op (
   id           TEXT PRIMARY KEY,
   library_id   TEXT NOT NULL REFERENCES library(id) ON DELETE CASCADE,
-  client_op_id TEXT NOT NULL UNIQUE,
+  client_op_id TEXT NOT NULL,
   op_type      TEXT NOT NULL,
   payload      TEXT NOT NULL,
   result       TEXT,
   applied_at   TEXT,
-  created_at   TEXT NOT NULL
+  created_at   TEXT NOT NULL,
+  -- 幂等键按库隔离：同一 client_op_id 可在不同库各自补录、各自独立且仅生效一次
+  UNIQUE (library_id, client_op_id)
 );
 
 CREATE TABLE IF NOT EXISTS weather_cache (

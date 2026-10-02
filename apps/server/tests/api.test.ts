@@ -414,6 +414,52 @@ describe('E9 离线补录幂等', () => {
     expect(second.status).toBe(200);
     expect(second.body.duplicate).toBe(true);
     expect(second.body.code).toBe('OFFLINE_OP_DUPLICATE');
+    // 返回的必须是该库首次执行时的结果（同一张灵感卡）
+    expect(second.body.result.inspirationId).toBe(first.body.result.inspirationId);
+  });
+
+  it('同一 clientOpId 在两个资料库各自独立生效，不返回对方的旧结果', async () => {
+    const ownerToken = token;
+    const registered = await request(app)
+      .post('/api/auth/register')
+      .send({ email: 'other@test.local', password: 'password123', displayName: '另一个库' });
+    expect(registered.status).toBe(201);
+    const otherToken = registered.body.token as string;
+
+    const opId = 'op-cross-library-shared-id';
+
+    const firstLib = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${ownerToken}`)
+      .send({ clientOpId: opId, opType: 'create_inspiration', payload: { title: '一库的断网记录' } });
+    expect(firstLib.status).toBe(201);
+    expect(firstLib.body.duplicate).toBe(false);
+
+    // 另一个库用完全相同的操作号：必须按首次执行处理，而不是命中一库的旧结果
+    const secondLib = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${otherToken}`)
+      .send({ clientOpId: opId, opType: 'create_inspiration', payload: { title: '二库的断网记录' } });
+    expect(secondLib.status).toBe(201);
+    expect(secondLib.body.duplicate).toBe(false);
+    expect(secondLib.body.result.inspirationId).not.toBe(firstLib.body.result.inspirationId);
+
+    // 各自再重试一次：都只返回本库的原结果
+    const firstRetry = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${ownerToken}`)
+      .send({ clientOpId: opId, opType: 'create_inspiration', payload: { title: '一库的断网记录' } });
+    expect(firstRetry.status).toBe(200);
+    expect(firstRetry.body.duplicate).toBe(true);
+    expect(firstRetry.body.result.inspirationId).toBe(firstLib.body.result.inspirationId);
+
+    const secondRetry = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${otherToken}`)
+      .send({ clientOpId: opId, opType: 'create_inspiration', payload: { title: '二库的断网记录' } });
+    expect(secondRetry.status).toBe(200);
+    expect(secondRetry.body.duplicate).toBe(true);
+    expect(secondRetry.body.result.inspirationId).toBe(secondLib.body.result.inspirationId);
   });
 });
 
