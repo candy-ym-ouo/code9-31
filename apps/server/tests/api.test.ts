@@ -414,6 +414,61 @@ describe('E9 离线补录幂等', () => {
     expect(second.status).toBe(200);
     expect(second.body.duplicate).toBe(true);
     expect(second.body.code).toBe('OFFLINE_OP_DUPLICATE');
+    expect(second.body.result.inspirationId).toBe(first.body.result.inspirationId);
+  });
+
+  it('同一 clientOpId 在不同资料库中各执行一次，并在各自库内保持幂等', async () => {
+    const opId = 'op-test-cross-library';
+    const firstInFirst = await call('post', '/api/offline/apply', {
+      clientOpId: opId,
+      opType: 'create_inspiration',
+      payload: { title: '原资料库断网时记下的一条' },
+    });
+    expect(firstInFirst.status).toBe(201);
+    expect(firstInFirst.body.duplicate).toBe(false);
+
+    const other = await request(app)
+      .post('/api/auth/register')
+      .send({
+        email: 'other-owner@test.local',
+        password: 'password123',
+        displayName: '另一个所有者',
+      });
+    expect(other.status).toBe(201);
+    const otherToken = other.body.token as string;
+
+    const firstInOther = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${otherToken}`)
+      .send({
+        clientOpId: opId,
+        opType: 'create_inspiration',
+        payload: { title: '另一个库断网时记下的一条' },
+      });
+    expect(firstInOther.status).toBe(201);
+    expect(firstInOther.body.duplicate).toBe(false);
+
+    const duplicateInOther = await request(app)
+      .post('/api/offline/apply')
+      .set('authorization', `Bearer ${otherToken}`)
+      .send({
+        clientOpId: opId,
+        opType: 'create_inspiration',
+        payload: { title: '另一个库断网时记下的一条' },
+      });
+    expect(duplicateInOther.status).toBe(200);
+    expect(duplicateInOther.body.duplicate).toBe(true);
+    expect(duplicateInOther.body.code).toBe('OFFLINE_OP_DUPLICATE');
+    expect(duplicateInOther.body.result.inspirationId).toBe(firstInOther.body.result.inspirationId);
+
+    const duplicateInFirst = await call('post', '/api/offline/apply', {
+      clientOpId: opId,
+      opType: 'create_inspiration',
+      payload: { title: '原资料库的操作号' },
+    });
+    expect(duplicateInFirst.status).toBe(200);
+    expect(duplicateInFirst.body.duplicate).toBe(true);
+    expect(duplicateInFirst.body.result.inspirationId).not.toBe(firstInOther.body.result.inspirationId);
   });
 });
 

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { Router } from 'express';
 import { z } from 'zod';
 import { offlineOpSchema } from '@flil/shared';
-import { getDb, newId, nowIso } from '../db.js';
+import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { config } from '../config.js';
 import { ah, ok } from '../http/respond.js';
 import { authenticate, requireOwner } from '../http/middleware.js';
@@ -12,7 +12,6 @@ import { createBackup, exportAll, listBackups, restoreBackup } from '../services
 import { addTags, createInspiration, requireInspiration } from '../services/inspirations.js';
 import { subscribe } from '../services/events.js';
 import { recomputeHitRate } from '../services/calibration.js';
-import { toJson } from '../db.js';
 
 export const opsRouter = Router();
 
@@ -117,8 +116,11 @@ opsRouter.get(
 );
 
 /**
- * 离线补录：client_op_id 唯一约束保证幂等。
- * 重复提交返回 200 与原结果（OFFLINE_OP_DUPLICATE 属于幂等成功，不是错误）。
+ * 离线补录：幂等键是「资料库 + client_op_id」。
+ * 整个检查、执行、落账放在同一个 IMMEDIATE 事务中：
+ * - 同一资料库里的重复提交返回原结果，不重复执行副作用；
+ * - 不同资料库可使用相同操作号，并得到彼此独立的结果；
+ * - 并发请求在数据库层串行化，避免先查到不存在后各自执行。
  */
 opsRouter.post(
   '/offline/apply',
@@ -127,91 +129,101 @@ opsRouter.post(
     const input = offlineOpSchema.parse(req.body);
     const db = getDb();
 
-    const existing = db
-      .prepare('SELECT * FROM offline_op WHERE client_op_id = ?')
-      .get(input.clientOpId) as Record<string, unknown> | undefined;
-    if (existing) {
-      return ok(res, {
-        duplicate: true,
-        code: 'OFFLINE_OP_DUPLICATE',
-        result: existing.result ? JSON.parse(existing.result as string) : null,
-      });
-    }
-
-    let result: Record<string, unknown> = {};
-    if (input.opType === 'create_inspiration') {
-      const payload = z.object({ title: z.string().min(1).max(200), note: z.string().max(5000).nullable().optional() }).parse(
-        input.payload,
-      );
-      const id = createInspiration({
-        libraryId: ctx.libraryId,
-        title: payload.title,
-        note: payload.note ?? null,
-      });
-      result = { inspirationId: id };
-    } else if (input.opType === 'tag') {
-      const payload = z
-        .object({ inspirationId: z.string().min(1), addTagIds: z.array(z.string()).default([]) })
-        .parse(input.payload);
-      requireInspiration(payload.inspirationId, ctx.libraryId);
-      const added = addTags(payload.inspirationId, payload.addTagIds, 'bulk');
-      result = { inspirationId: payload.inspirationId, added };
-    } else if (input.opType === 'fill_result') {
-      const payload = z
-        .object({
-          planId: z.string().min(1),
-          hitLevel: z.enum(['hit', 'partial', 'miss']),
-          missReasons: z.array(z.string()).default([]),
-        })
-        .parse(input.payload);
-      const plan = db
-        .prepare('SELECT * FROM shoot_plan WHERE id = ? AND library_id = ?')
-        .get(payload.planId, ctx.libraryId) as Record<string, unknown> | undefined;
-      if (!plan) throw errors.notFound('计划');
-      const exists = db.prepare('SELECT id FROM shoot_result WHERE plan_id = ?').get(payload.planId);
-      if (!exists) {
-        db.prepare(
-          `INSERT INTO shoot_result (id, library_id, plan_id, inspiration_id, hit_level, miss_reasons, filled_at, created_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
-        ).run(
-          newId(),
-          ctx.libraryId,
-          payload.planId,
-          plan.inspiration_id as string,
-          payload.hitLevel,
-          toJson(payload.missReasons),
-          nowIso(),
-          nowIso(),
-        );
-        db.prepare("UPDATE shoot_plan SET status = 'done', updated_at = ? WHERE id = ?").run(nowIso(), payload.planId);
-        recomputeHitRate(plan.inspiration_id as string);
+    const applyOnce = db.transaction((): { duplicate: boolean; result: unknown } => {
+      const existing = db
+        .prepare('SELECT * FROM offline_op WHERE library_id = ? AND client_op_id = ?')
+        .get(ctx.libraryId, input.clientOpId) as Record<string, unknown> | undefined;
+      if (existing) {
+        return {
+          duplicate: true,
+          result: parseJson<unknown>(existing.result, null),
+        };
       }
-      result = { planId: payload.planId, applied: true };
-    } else {
-      const payload = z.object({ inspirationId: z.string().min(1), note: z.string().max(5000) }).parse(input.payload);
-      requireInspiration(payload.inspirationId, ctx.libraryId);
-      db.prepare('UPDATE inspiration SET note = ?, updated_at = ? WHERE id = ?').run(
-        payload.note,
+
+      let result: Record<string, unknown> = {};
+      if (input.opType === 'create_inspiration') {
+        const payload = z.object({ title: z.string().min(1).max(200), note: z.string().max(5000).nullable().optional() }).parse(
+          input.payload,
+        );
+        const id = createInspiration({
+          libraryId: ctx.libraryId,
+          title: payload.title,
+          note: payload.note ?? null,
+        });
+        result = { inspirationId: id };
+      } else if (input.opType === 'tag') {
+        const payload = z
+          .object({ inspirationId: z.string().min(1), addTagIds: z.array(z.string()).default([]) })
+          .parse(input.payload);
+        requireInspiration(payload.inspirationId, ctx.libraryId);
+        const added = addTags(payload.inspirationId, payload.addTagIds, 'bulk');
+        result = { inspirationId: payload.inspirationId, added };
+      } else if (input.opType === 'fill_result') {
+        const payload = z
+          .object({
+            planId: z.string().min(1),
+            hitLevel: z.enum(['hit', 'partial', 'miss']),
+            missReasons: z.array(z.string()).default([]),
+          })
+          .parse(input.payload);
+        const plan = db
+          .prepare('SELECT * FROM shoot_plan WHERE id = ? AND library_id = ?')
+          .get(payload.planId, ctx.libraryId) as Record<string, unknown> | undefined;
+        if (!plan) throw errors.notFound('计划');
+        const exists = db.prepare('SELECT id FROM shoot_result WHERE plan_id = ?').get(payload.planId);
+        if (!exists) {
+          db.prepare(
+            `INSERT INTO shoot_result (id, library_id, plan_id, inspiration_id, hit_level, miss_reasons, filled_at, created_at)
+             VALUES (?,?,?,?,?,?,?,?)`,
+          ).run(
+            newId(),
+            ctx.libraryId,
+            payload.planId,
+            plan.inspiration_id as string,
+            payload.hitLevel,
+            toJson(payload.missReasons),
+            nowIso(),
+            nowIso(),
+          );
+          db.prepare("UPDATE shoot_plan SET status = 'done', updated_at = ? WHERE id = ?").run(nowIso(), payload.planId);
+          recomputeHitRate(plan.inspiration_id as string);
+        }
+        result = { planId: payload.planId, applied: true };
+      } else {
+        const payload = z.object({ inspirationId: z.string().min(1), note: z.string().max(5000) }).parse(input.payload);
+        requireInspiration(payload.inspirationId, ctx.libraryId);
+        db.prepare('UPDATE inspiration SET note = ?, updated_at = ? WHERE id = ?').run(
+          payload.note,
+          nowIso(),
+          payload.inspirationId,
+        );
+        result = { inspirationId: payload.inspirationId, updated: true };
+      }
+
+      db.prepare(
+        'INSERT INTO offline_op (id, library_id, client_op_id, op_type, payload, result, applied_at, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      ).run(
+        newId(),
+        ctx.libraryId,
+        input.clientOpId,
+        input.opType,
+        toJson(input.payload),
+        toJson(result),
         nowIso(),
-        payload.inspirationId,
+        nowIso(),
       );
-      result = { inspirationId: payload.inspirationId, updated: true };
+
+      return { duplicate: false, result };
+    });
+
+    // IMMEDIATE 先取得写锁；并发同键请求会等待前一个事务提交后读到原结果。
+    const outcome: { duplicate: boolean; result: unknown } = applyOnce.immediate();
+
+    if (outcome.duplicate) {
+      ok(res, { duplicate: true, code: 'OFFLINE_OP_DUPLICATE', result: outcome.result });
+    } else {
+      ok(res, { duplicate: false, result: outcome.result }, 201);
     }
-
-    db.prepare(
-      'INSERT INTO offline_op (id, library_id, client_op_id, op_type, payload, result, applied_at, created_at) VALUES (?,?,?,?,?,?,?,?)',
-    ).run(
-      newId(),
-      ctx.libraryId,
-      input.clientOpId,
-      input.opType,
-      toJson(input.payload),
-      toJson(result),
-      nowIso(),
-      nowIso(),
-    );
-
-    ok(res, { duplicate: false, result }, 201);
   }),
 );
 
